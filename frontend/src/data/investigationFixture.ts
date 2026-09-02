@@ -1,0 +1,177 @@
+import type { Investigation } from "../types/investigation";
+
+export const investigationFixture: Investigation = {
+  id: "INV-0001",
+  createdAt: "2026-08-28T09:00:00Z",
+
+  wallet: {
+    id: "target",
+    address: "0x71C7656EC7ab88b098defB751B7401B5f6d8976F",
+    label: "Investigation Target",
+    role: "target",
+  },
+
+  nodes: [
+    {
+      id: "target",
+      walletId: "target",
+      label: "Target Wallet",
+      role: "target",
+    },
+    {
+      id: "wallet-a",
+      walletId: "wallet-a",
+      label: "Intermediate A",
+      role: "intermediary",
+    },
+    {
+      id: "wallet-b",
+      walletId: "wallet-b",
+      label: "Intermediate B",
+      role: "intermediary",
+    },
+    {
+      id: "wallet-c",
+      walletId: "wallet-c",
+      label: "Intermediate C",
+      role: "intermediary",
+    },
+    {
+      id: "exchange",
+      walletId: "exchange",
+      label: "Candidate Exchange",
+      role: "exchange",
+    },
+  ],
+
+  edges: [
+    {
+      id: "tx-001",
+      source: "target",
+      target: "wallet-a",
+      transactionId: "0xTX001",
+      amount: 2.4,
+      asset: "ETH",
+      timestamp: "2026-08-28T09:15:00Z",
+      suspicious: true,
+      evidenceIds: ["EV-TX-001"],
+    },
+    {
+      id: "tx-002",
+      source: "wallet-a",
+      target: "wallet-b",
+      transactionId: "0xTX002",
+      amount: 2.35,
+      asset: "ETH",
+      timestamp: "2026-08-28T09:42:00Z",
+      suspicious: true,
+      evidenceIds: ["EV-TX-002"],
+    },
+    {
+      id: "tx-003",
+      source: "wallet-b",
+      target: "wallet-c",
+      transactionId: "0xTX003",
+      amount: 2.3,
+      asset: "ETH",
+      timestamp: "2026-08-28T10:03:00Z",
+      suspicious: true,
+      evidenceIds: ["EV-TX-003"],
+    },
+    {
+      id: "tx-004",
+      source: "wallet-c",
+      target: "exchange",
+      transactionId: "0xTX004",
+      amount: 2.25,
+      asset: "ETH",
+      timestamp: "2026-08-28T10:21:00Z",
+      suspicious: false,
+      evidenceIds: ["EV-TX-004"],
+    },
+  ],
+
+  risk: {
+    score: 82,
+    level: "high",
+
+    factors: [
+      {
+        id: "RF-001",
+        name: "Rapid multi-hop movement",
+        contribution: 30,
+        explanation:
+          "Funds moved through multiple intermediary wallets within a short period.",
+        evidenceIds: ["EV-TX-001", "EV-TX-002", "EV-TX-003"],
+      },
+      {
+        id: "RF-002",
+        name: "High-value transfer chain",
+        contribution: 27,
+        explanation:
+          "The observed transaction chain contains transfers of significant value.",
+        evidenceIds: ["EV-TX-001", "EV-TX-002", "EV-TX-003"],
+      },
+      {
+        id: "RF-003",
+        name: "Suspicious transaction pattern",
+        contribution: 25,
+        explanation:
+          "Several consecutive transactions have been marked as suspicious by the deterministic analysis layer.",
+        evidenceIds: ["EV-TX-001", "EV-TX-002", "EV-TX-003"],
+      },
+    ],
+  },
+
+  attribution: [
+    {
+      entityName: "Candidate Exchange",
+      confidence: 0.78,
+      status: "candidate",
+      evidenceIds: ["EV-TX-004"],
+    },
+  ],
+
+  evidence: [
+    {
+      id: "EV-TX-001",
+      type: "transaction",
+      title: "Initial target transfer",
+      description:
+        "The target wallet transferred 2.4 ETH to an intermediary wallet.",
+      source: "Ethereum transaction 0xTX001",
+      timestamp: "2026-08-28T09:15:00Z",
+      immutable: true,
+    },
+    {
+      id: "EV-TX-002",
+      type: "transaction",
+      title: "Second-hop transfer",
+      description:
+        "The first intermediary transferred 2.35 ETH to a second intermediary.",
+      source: "Ethereum transaction 0xTX002",
+      timestamp: "2026-08-28T09:42:00Z",
+      immutable: true,
+    },
+    {
+      id: "EV-TX-003",
+      type: "transaction",
+      title: "Third-hop transfer",
+      description:
+        "The second intermediary transferred 2.3 ETH to a third intermediary.",
+      source: "Ethereum transaction 0xTX003",
+      timestamp: "2026-08-28T10:03:00Z",
+      immutable: true,
+    },
+    {
+      id: "EV-TX-004",
+      type: "transaction",
+      title: "Transfer to candidate exchange",
+      description:
+        "The third intermediary transferred 2.25 ETH to a wallet currently considered a candidate exchange attribution.",
+      source: "Ethereum transaction 0xTX004",
+      timestamp: "2026-08-28T10:21:00Z",
+      immutable: true,
+    },
+  ],
+};
