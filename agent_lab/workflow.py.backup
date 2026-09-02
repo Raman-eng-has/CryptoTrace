@@ -1,0 +1,125 @@
+from dataclasses import dataclass, field
+from typing import Literal
+
+
+Agent = Literal[
+    "blockchain",
+    "graph",
+    "risk",
+    "platform",
+    "copilot",
+    "ui",
+]
+
+
+@dataclass
+class WorkflowTask:
+    task_id: str
+    agent: Agent
+    objective: str
+    depends_on: list[str] = field(default_factory=list)
+    status: Literal[
+        "pending",
+        "ready",
+        "running",
+        "completed",
+        "blocked",
+        "failed",
+    ] = "pending"
+
+
+V1_WORKFLOW: list[WorkflowTask] = [
+    WorkflowTask(
+        task_id="blockchain-001",
+        agent="blockchain",
+        objective=(
+            "Implement the blockchain/data foundation for the first "
+            "CryptoTrace vertical slice, including normalized transaction "
+            "data, provider abstraction, evidence creation, and provenance."
+        ),
+    ),
+    WorkflowTask(
+        task_id="graph-001",
+        agent="graph",
+        objective=(
+            "Implement the transaction graph layer using the blockchain "
+            "contracts and evidence produced by blockchain-001."
+        ),
+        depends_on=["blockchain-001"],
+    ),
+    WorkflowTask(
+        task_id="risk-001",
+        agent="risk",
+        objective=(
+            "Implement the deterministic CryptoTrace Risk and Decision "
+            "Engine using approved parameters, rules, scoring, and evidence "
+            "references."
+        ),
+        depends_on=["graph-001"],
+    ),
+    WorkflowTask(
+        task_id="platform-001",
+        agent="platform",
+        objective=(
+            "Implement the backend/API layer that exposes investigation "
+            "data, risk results, provenance, and the Structured Evidence "
+            "Packet."
+        ),
+        depends_on=["risk-001"],
+    ),
+    WorkflowTask(
+        task_id="copilot-001",
+        agent="copilot",
+        objective=(
+            "Implement the V1 Nemotron Copilot capabilities: evidence "
+            "summarization, risk-factor explanation, and evidence-grounded "
+            "Q&A with validation and graceful failure."
+        ),
+        depends_on=["platform-001"],
+    ),
+    WorkflowTask(
+        task_id="ui-001",
+        agent="ui",
+        objective=(
+            "Integrate the CryptoTrace frontend with the completed backend "
+            "vertical slice and expose investigation, graph, risk, evidence, "
+            "and Copilot workflows."
+        ),
+        depends_on=["copilot-001"],
+    ),
+    WorkflowTask(
+        task_id="integration-001",
+        agent="platform",
+        objective=(
+            "Run the complete end-to-end CryptoTrace vertical slice, verify "
+            "all contracts, execute tests, and report remaining failures."
+        ),
+        depends_on=["ui-001"],
+    ),
+]
+
+
+def get_task(task_id: str) -> WorkflowTask:
+    for task in V1_WORKFLOW:
+        if task.task_id == task_id:
+            return task
+
+    raise ValueError(f"Unknown workflow task: {task_id}")
+
+
+def dependencies_completed(task: WorkflowTask) -> bool:
+    return all(
+        get_task(dependency).status == "completed"
+        for dependency in task.depends_on
+    )
+
+
+def get_ready_tasks() -> list[WorkflowTask]:
+    ready: list[WorkflowTask] = []
+
+    for task in V1_WORKFLOW:
+        if task.status == "pending" and dependencies_completed(task):
+            task.status = "ready"
+            ready.append(task)
+
+    return ready

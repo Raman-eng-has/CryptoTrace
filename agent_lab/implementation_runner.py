@@ -1,0 +1,1229 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from openai import OpenAI
+
+from agent_lab.approval import is_approved
+from agent_lab.workflow import WorkflowTask, set_task_status
+
+MODEL = "nvidia/nemotron-3-nano-30b-a3b"
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+
+# ------------------------------------------------------------
+# Safety / resource limits
+# ------------------------------------------------------------
+
+MAX_IMPLEMENTATION_ATTEMPTS = 2
+
+# Maximum size of one source file sent to Nemotron.
+MAX_FILE_SIZE = 100_000
+
+# Maximum repository context sent to Nemotron.
+MAX_REPOSITORY_CONTEXT_BYTES = 2_000_000
+
+# Maximum generated file size accepted from Nemotron.
+MAX_GENERATED_FILE_BYTES = 200_000
+
+# Directories that must never be inspected/modified by the
+# implementation agent.
+PROTECTED_DIRECTORIES = {
+    ".git",
+    ".venv",
+    "__pycache__",
+    ".agent_approvals",
+    ".pytest_cache",
+    "node_modules",
+    "dist",
+    "build",
+}
+
+# Files that contain secrets or local environment state.
+PROTECTED_ROOT_FILES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+}
+
+# File types useful to a coding agent.
+ALLOWED_EXTENSIONS = {
+    ".py",
+    ".md",
+    ".txt",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".tsx",
+    ".ts",
+    ".js",
+    ".jsx",
+}
+
+# The implementation agent must never modify the control plane.
+CONTROL_PLANE_PREFIX = "agent_lab/"
+
+
+# ============================================================
+# PATH SAFETY
+# ============================================================
+
+def safe_relative_path(
+    repo_root: Path,
+    relative_path: str,
+) -> Path:
+    """
+    Resolve a model-provided path safely inside the repository.
+
+    Prevents:
+    - ../ traversal
+    - absolute paths
+    - protected directory access
+    """
+
+    if not isinstance(relative_path, str):
+        raise ValueError("File path must be a string.")
+
+    relative_path = relative_path.strip()
+
+    if not relative_path:
+        raise ValueError("Implementation returned an empty file path.")
+
+    # Normalize Windows separators.
+    relative_path = relative_path.replace("\\", "/")
+
+    candidate = Path(relative_path)
+
+    if candidate.is_absolute():
+        raise ValueError(
+            f"Absolute paths are not allowed: {relative_path}"
+        )
+
+    # Explicit traversal protection.
+    if ".." in candidate.parts:
+        raise ValueError(
+            f"Path traversal is not allowed: {relative_path}"
+        )
+
+    repo_root = repo_root.resolve()
+    path = (repo_root / candidate).resolve()
+
+    try:
+        path.relative_to(repo_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Path escapes repository: {relative_path}"
+        ) from exc
+
+    parts = candidate.parts
+
+    if any(
+        part in PROTECTED_DIRECTORIES
+        for part in parts
+    ):
+        raise ValueError(
+            f"Protected directory cannot be accessed: "
+            f"{relative_path}"
+        )
+
+    if candidate.name in PROTECTED_ROOT_FILES:
+        raise ValueError(
+            f"Protected environment file cannot be modified: "
+            f"{relative_path}"
+        )
+
+    return path
+
+
+def normalize_relative_path(
+    relative_path: str,
+) -> str:
+    """
+    Normalize a repository-relative path for comparisons.
+    """
+
+    return relative_path.strip().replace("\\", "/")
+
+
+# ============================================================
+# REPOSITORY INSPECTION
+# ============================================================
+
+def repository_files(
+    repo_root: Path,
+) -> list[str]:
+    """
+    Return relevant repository files.
+
+    The implementation agent intentionally cannot inspect
+    agent_lab because agent_lab is the orchestration control plane.
+    """
+
+    files: list[str] = []
+
+    for path in repo_root.rglob("*"):
+
+        if not path.is_file():
+            continue
+
+        try:
+            relative = path.relative_to(repo_root)
+        except ValueError:
+            continue
+
+        relative_string = normalize_relative_path(
+            str(relative)
+        )
+
+        # Never expose the orchestration system.
+        if (
+            relative_string == "agent_lab"
+            or relative_string.startswith(CONTROL_PLANE_PREFIX)
+        ):
+            continue
+
+        # Never expose protected directories.
+        if any(
+            part in PROTECTED_DIRECTORIES
+            for part in relative.parts
+        ):
+            continue
+
+        # Ignore unsupported file types.
+        if path.suffix.lower() not in ALLOWED_EXTENSIONS:
+            continue
+
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+
+        if size > MAX_FILE_SIZE:
+            continue
+
+        files.append(relative_string)
+
+    return sorted(files)
+
+
+def read_repository(
+    repo_root: Path,
+) -> str:
+    """
+    Build a bounded repository context for Nemotron.
+
+    Important:
+    We do NOT send the entire repository blindly.
+    """
+
+    output: list[str] = []
+
+    total_bytes = 0
+
+    for relative in repository_files(repo_root):
+
+        path = repo_root / relative
+
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+
+        if size > MAX_FILE_SIZE:
+            continue
+
+        if total_bytes + size > MAX_REPOSITORY_CONTEXT_BYTES:
+            break
+
+        try:
+            content = path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception:
+            continue
+
+        block = (
+            f"\n===== {relative} =====\n"
+            f"{content}\n"
+        )
+
+        block_bytes = len(
+            block.encode("utf-8")
+        )
+
+        if (
+            total_bytes + block_bytes
+            > MAX_REPOSITORY_CONTEXT_BYTES
+        ):
+            break
+
+        output.append(block)
+
+        total_bytes += block_bytes
+
+    if not output:
+        return "(No relevant project files found.)"
+
+    return "\n".join(output)
+
+
+# ============================================================
+# REPOSITORY SNAPSHOTS
+# ============================================================
+
+def file_hash(
+    path: Path,
+) -> str | None:
+    """
+    Calculate SHA-256 for a file.
+
+    This function is intentionally separate because the Lead uses
+    it to detect what the implementation agent actually changed.
+    """
+
+    if not path.exists():
+        return None
+
+    if not path.is_file():
+        return None
+
+    digest = hashlib.sha256()
+
+    try:
+        with path.open("rb") as handle:
+
+            while True:
+
+                chunk = handle.read(64 * 1024)
+
+                if not chunk:
+                    break
+
+                digest.update(chunk)
+
+    except OSError:
+        return None
+
+    return digest.hexdigest()
+
+
+def snapshot_repository(
+    repo_root: Path,
+) -> dict[str, str | None]:
+    """
+    Snapshot hashes of relevant repository files.
+    """
+
+    snapshot: dict[str, str | None] = {}
+
+    for relative in repository_files(repo_root):
+
+        path = repo_root / relative
+
+        snapshot[relative] = file_hash(path)
+
+    return snapshot
+
+
+def detect_repository_changes(
+    before: dict[str, str | None],
+    after: dict[str, str | None],
+) -> list[str]:
+
+    changed: list[str] = []
+
+    all_paths = set(before) | set(after)
+
+    for relative in sorted(all_paths):
+
+        if before.get(relative) != after.get(relative):
+            changed.append(relative)
+
+    return changed
+
+
+# ============================================================
+# IMPLEMENTATION RESPONSE PARSING
+# ============================================================
+
+def strip_markdown_fence(
+    text: str,
+) -> str:
+    """
+    Nemotron occasionally wraps JSON in ```json fences.
+    Remove them before parsing.
+    """
+
+    text = text.strip()
+
+    if not text.startswith("```"):
+        return text
+
+    first_newline = text.find("\n")
+
+    if first_newline == -1:
+        return text
+
+    text = text[first_newline + 1:]
+
+    if text.endswith("```"):
+        text = text[:-3]
+
+    return text.strip()
+
+
+def parse_implementation_response(
+    response_text: str,
+) -> dict[str, Any]:
+
+    if not response_text:
+        raise ValueError(
+            "Implementation agent returned an empty response."
+        )
+
+    text = strip_markdown_fence(
+        response_text
+    )
+
+    try:
+        data = json.loads(text)
+
+    except json.JSONDecodeError as exc:
+
+        raise ValueError(
+            "Implementation agent did not return valid JSON."
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            "Implementation response must be a JSON object."
+        )
+
+    changes = data.get("changes")
+
+    if not isinstance(changes, list):
+        raise ValueError(
+            "Implementation response must contain "
+            "a 'changes' list."
+        )
+
+    for index, change in enumerate(changes):
+
+        if not isinstance(change, dict):
+            raise ValueError(
+                f"Change #{index + 1} must be an object."
+            )
+
+        if not isinstance(
+            change.get("path"),
+            str,
+        ):
+            raise ValueError(
+                f"Change #{index + 1} has an invalid path."
+            )
+
+        if not isinstance(
+            change.get("content"),
+            str,
+        ):
+            raise ValueError(
+                f"Change #{index + 1} has invalid content."
+            )
+
+    return data
+
+
+# ============================================================
+# GENERATED CODE SAFETY
+# ============================================================
+
+def validate_generated_content(
+    relative_path: str,
+    content: str,
+) -> None:
+    """
+    Basic protection against accidental credential commits.
+
+    This is not intended to replace a real secret scanner.
+    """
+
+    content_bytes = len(
+        content.encode("utf-8")
+    )
+
+    if content_bytes > MAX_GENERATED_FILE_BYTES:
+        raise ValueError(
+            f"Generated file is too large: {relative_path}"
+        )
+
+    lower_content = content.lower()
+
+    suspicious_patterns = [
+        "nvidia_api_key=",
+        "openai_api_key=",
+        "private_key=",
+        "password=",
+        "secret_key=",
+        "aws_secret_access_key=",
+        "authorization: bearer ",
+    ]
+
+    for pattern in suspicious_patterns:
+
+        if pattern in lower_content:
+            raise ValueError(
+                f"Possible hard-coded secret detected in "
+                f"{relative_path}: {pattern}"
+            )
+
+
+def validate_changes(
+    repo_root: Path,
+    task: WorkflowTask,
+    data: dict[str, Any],
+) -> None:
+    """
+    Validate every model-proposed file change before writing it.
+    """
+
+    changes = data.get("changes", [])
+
+    seen_paths: set[str] = set()
+
+    for change in changes:
+
+        relative = normalize_relative_path(
+            change["path"]
+        )
+
+        # --------------------------------------------------------
+        # No duplicate changes.
+        # --------------------------------------------------------
+
+        if relative in seen_paths:
+            raise ValueError(
+                f"Duplicate file change: {relative}"
+            )
+
+        seen_paths.add(relative)
+
+        # --------------------------------------------------------
+        # Path validation.
+        # --------------------------------------------------------
+
+        safe_relative_path(
+            repo_root,
+            relative,
+        )
+
+        # --------------------------------------------------------
+        # Never allow an implementation agent to modify
+        # the orchestration/control plane.
+        # --------------------------------------------------------
+
+        if (
+            relative == "agent_lab"
+            or relative.startswith(CONTROL_PLANE_PREFIX)
+        ):
+            raise ValueError(
+                f"{task.agent} cannot modify the orchestration "
+                f"control plane: {relative}"
+            )
+
+        # --------------------------------------------------------
+        # Content validation.
+        # --------------------------------------------------------
+
+        content = change["content"]
+
+        validate_generated_content(
+            relative_path=relative,
+            content=content,
+        )
+
+
+# ============================================================
+# APPLY FILE CHANGES
+# ============================================================
+
+def apply_changes(
+    repo_root: Path,
+    data: dict[str, Any],
+) -> list[str]:
+
+    changed_files: list[str] = []
+
+    for change in data["changes"]:
+
+        relative = normalize_relative_path(
+            change["path"]
+        )
+
+        path = safe_relative_path(
+            repo_root,
+            relative,
+        )
+
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        path.write_text(
+            change["content"],
+            encoding="utf-8",
+        )
+
+        changed_files.append(relative)
+
+    return changed_files
+
+
+# ============================================================
+# TESTING
+# ============================================================
+
+def run_tests(
+    repo_root: Path,
+) -> tuple[bool, str]:
+    """
+    Run the project's available verification.
+
+    Priority:
+    1. pytest
+    2. backend pytest
+    3. Python compileall
+    """
+
+    commands: list[list[str]] = []
+
+    tests_directory = repo_root / "tests"
+
+    backend_tests = (
+        repo_root
+        / "backend"
+        / "tests"
+    )
+
+    if tests_directory.exists():
+
+        commands.append(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+            ]
+        )
+
+    elif backend_tests.exists():
+
+        commands.append(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "backend/tests",
+                "-q",
+            ]
+        )
+
+    else:
+
+        commands.append(
+            [
+                sys.executable,
+                "-m",
+                "compileall",
+                "-q",
+                str(repo_root),
+            ]
+        )
+
+    outputs: list[str] = []
+
+    overall_success = True
+
+    for command in commands:
+
+        command_display = " ".join(command)
+
+        try:
+
+            completed = subprocess.run(
+                command,
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+
+            stdout = completed.stdout or ""
+            stderr = completed.stderr or ""
+
+            output = (
+                stdout
+                + "\n"
+                + stderr
+            ).strip()
+
+            outputs.append(
+                f"$ {command_display}\n"
+                f"{output}"
+            )
+
+            if completed.returncode != 0:
+                overall_success = False
+
+        except subprocess.TimeoutExpired:
+
+            overall_success = False
+
+            outputs.append(
+                f"$ {command_display}\n"
+                "TEST COMMAND TIMED OUT."
+            )
+
+        except Exception as exc:
+
+            overall_success = False
+
+            outputs.append(
+                f"$ {command_display}\n"
+                f"TEST COMMAND FAILED: {exc}"
+            )
+
+    return (
+        overall_success,
+        "\n\n".join(outputs),
+    )
+
+
+# ============================================================
+# NEMOTRON PROMPT
+# ============================================================
+
+def build_implementation_prompt(
+    repo_root: Path,
+    task: WorkflowTask,
+    test_feedback: str = "",
+) -> str:
+
+    repository = read_repository(
+        repo_root
+    )
+
+    feedback_section = ""
+
+    if test_feedback:
+
+        feedback_section = f"""
+
+PREVIOUS IMPLEMENTATION VERIFICATION
+=====================================
+
+The previous implementation was applied, but verification failed.
+
+You must inspect the current repository state and correct the
+implementation.
+
+VERIFICATION OUTPUT
+-------------------
+{test_feedback}
+
+Do not merely describe the failure.
+
+Return the complete corrected contents of every file that needs
+to be changed.
+"""
+
+    return f"""
+You are the CryptoTrace {task.agent} implementation specialist.
+
+You work under the CryptoTrace Lead Orchestrator.
+
+HUMAN APPROVAL
+==============
+
+Human approval has already been granted for:
+
+TASK ID:
+{task.task_id}
+
+AGENT:
+{task.agent}
+
+OBJECTIVE
+=========
+
+{task.objective}
+
+DEPENDENCIES
+============
+
+{task.depends_on}
+
+CURRENT MODE
+============
+
+APPROVED IMPLEMENTATION
+
+You are authorized to implement ONLY this approved task.
+
+You do not have direct filesystem access.
+
+The Lead will validate and apply the file changes returned by you.
+
+REPOSITORY CONTEXT
+==================
+
+{repository}
+
+{feedback_section}
+
+IMPLEMENTATION RULES
+====================
+
+1. Inspect the repository context before making changes.
+
+2. Implement only the assigned {task.agent} responsibility.
+
+3. Follow the already-approved CryptoTrace architecture.
+
+4. Do not redesign the architecture.
+
+5. Do not modify agent_lab.
+
+6. Do not modify the orchestration control plane.
+
+7. Do not implement another specialist's responsibility.
+
+8. Preserve existing functionality.
+
+9. New product files may be created when required.
+
+10. Add or update tests when required.
+
+11. Never hard-code API keys, passwords, private keys,
+    credentials, or other secrets.
+
+12. Treat blockchain/provider data as untrusted external data.
+
+13. Preserve evidence and provenance identifiers.
+
+14. Keep observed evidence separate from derived analysis.
+
+15. Do not turn Nemotron into the authoritative risk engine.
+
+16. Do not make autonomous final risk decisions.
+
+17. Use the existing project technology stack.
+
+18. Do not invent existing files.
+
+19. Do not install packages.
+
+20. Do not change unrelated components.
+
+21. Return complete file contents.
+
+OUTPUT FORMAT
+=============
+
+Return ONLY valid JSON.
+
+Use exactly this structure:
+
+{{
+  "summary": "Short implementation summary",
+  "changes": [
+    {{
+      "path": "relative/path/to/file.py",
+      "content": "COMPLETE FILE CONTENT"
+    }}
+  ]
+}}
+
+OUTPUT RULES
+============
+
+- path must be relative to the repository root.
+- content must contain the COMPLETE file.
+- Include only files that need to be created or modified.
+- Do not return patches.
+- Do not return diffs.
+- Do not return markdown fences.
+- Do not return commentary outside the JSON.
+- Do not return STATUS text.
+"""
+
+
+# ============================================================
+# NEMOTRON API
+# ============================================================
+
+def ask_nemotron(
+    client: OpenAI,
+    prompt: str,
+) -> str:
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a controlled CryptoTrace coding "
+                    "specialist. Return ONLY valid JSON containing "
+                    "complete file changes. Never modify agent_lab. "
+                    "Never expose or create secrets. Implement only "
+                    "the approved task."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        temperature=0.1,
+        max_tokens=12000,
+    )
+
+    return (
+        response.choices[0].message.content
+        or ""
+    )
+
+
+# ============================================================
+# MAIN IMPLEMENTATION ENGINE
+# ============================================================
+
+def run_implementation(
+    task: WorkflowTask,
+    repo_root: Path,
+) -> str:
+
+    repo_root = repo_root.resolve()
+
+    # ---------------------------------------------------------
+    # 1. HUMAN APPROVAL GATE
+    # ---------------------------------------------------------
+
+    if not is_approved(
+        task_id=task.task_id,
+        repo_root=repo_root,
+    ):
+        raise RuntimeError(
+            f"Implementation blocked: human approval for "
+            f"{task.task_id} was not found."
+        )
+
+    # ---------------------------------------------------------
+    # 2. API KEY
+    # ---------------------------------------------------------
+
+    api_key = os.environ.get(
+        "NVIDIA_API_KEY"
+    )
+
+    if not api_key:
+
+        raise RuntimeError(
+            "NVIDIA_API_KEY is not set in the current "
+            "PowerShell session."
+        )
+
+    # ---------------------------------------------------------
+    # 3. CLIENT
+    # ---------------------------------------------------------
+
+    client = OpenAI(
+        base_url=NVIDIA_BASE_URL,
+        api_key=api_key,
+    )
+
+    previous_test_feedback = ""
+
+    # ---------------------------------------------------------
+    # 4. IMPLEMENTATION / REPAIR LOOP
+    # ---------------------------------------------------------
+
+    for attempt in range(
+        1,
+        MAX_IMPLEMENTATION_ATTEMPTS + 1,
+    ):
+
+        print()
+        print("=" * 70)
+        print(
+            f"IMPLEMENTATION ATTEMPT "
+            f"{attempt}/{MAX_IMPLEMENTATION_ATTEMPTS}"
+        )
+        print("=" * 70)
+
+        # -----------------------------------------------------
+        # Snapshot BEFORE model response.
+        # -----------------------------------------------------
+
+        before = snapshot_repository(
+            repo_root
+        )
+
+        # -----------------------------------------------------
+        # Build bounded context.
+        # -----------------------------------------------------
+
+        prompt = build_implementation_prompt(
+            repo_root=repo_root,
+            task=task,
+            test_feedback=previous_test_feedback,
+        )
+
+        print()
+        print("LEAD → NEMOTRON")
+        print("Generating controlled implementation...")
+        print()
+
+        # -----------------------------------------------------
+        # Ask implementation model.
+        # -----------------------------------------------------
+
+        try:
+
+            response_text = ask_nemotron(
+                client=client,
+                prompt=prompt,
+            )
+
+        except Exception as exc:
+
+            print()
+            print("NEMOTRON REQUEST FAILED")
+            print("-" * 70)
+            print(type(exc).__name__)
+            print(str(exc))
+
+            return (
+                "STATUS: IMPLEMENTATION_BLOCKED\n\n"
+                "Nemotron request failed.\n"
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        # -----------------------------------------------------
+        # Parse response.
+        # -----------------------------------------------------
+
+        try:
+
+            implementation = (
+                parse_implementation_response(
+                    response_text
+                )
+            )
+
+            validate_changes(
+                repo_root=repo_root,
+                task=task,
+                data=implementation,
+            )
+
+        except Exception as exc:
+
+            previous_test_feedback = (
+                "The implementation response failed validation.\n\n"
+                f"Validation error: {exc}\n\n"
+                "Return valid JSON using the exact required "
+                "changes schema."
+            )
+
+            print()
+            print("IMPLEMENTATION RESPONSE INVALID")
+            print("-" * 70)
+            print(str(exc))
+
+            if attempt >= MAX_IMPLEMENTATION_ATTEMPTS:
+                break
+
+            continue
+
+        # -----------------------------------------------------
+        # Show proposed changes.
+        # -----------------------------------------------------
+
+        proposed_changes = implementation.get(
+            "changes",
+            [],
+        )
+
+        print()
+        print("PROPOSED FILE CHANGES")
+        print("-" * 70)
+
+        if proposed_changes:
+
+            for change in proposed_changes:
+                print(
+                    f"- "
+                    f"{normalize_relative_path(change['path'])}"
+                )
+
+        else:
+
+            print(
+                "(Agent returned zero file changes.)"
+            )
+
+        # -----------------------------------------------------
+        # Apply validated changes.
+        # -----------------------------------------------------
+
+        try:
+
+            apply_changes(
+                repo_root=repo_root,
+                data=implementation,
+            )
+
+        except Exception as exc:
+
+            previous_test_feedback = (
+                "The validated implementation could not be "
+                f"written to disk: {exc}"
+            )
+
+            print()
+            print("FILE APPLICATION FAILED")
+            print("-" * 70)
+            print(str(exc))
+
+            break
+
+        # -----------------------------------------------------
+        # Snapshot AFTER.
+        # -----------------------------------------------------
+
+        after = snapshot_repository(
+            repo_root
+        )
+
+        actual_changes = (
+            detect_repository_changes(
+                before=before,
+                after=after,
+            )
+        )
+
+        print()
+        print("FILES ACTUALLY CHANGED")
+        print("-" * 70)
+
+        if actual_changes:
+
+            for relative in actual_changes:
+                print(f"- {relative}")
+
+        else:
+
+            print("(No repository changes detected.)")
+
+        # -----------------------------------------------------
+        # Verification.
+        # -----------------------------------------------------
+
+        print()
+        print("RUNNING VERIFICATION")
+        print("-" * 70)
+
+        tests_passed, test_output = (
+            run_tests(repo_root)
+        )
+
+        print(test_output)
+
+        # -----------------------------------------------------
+        # SUCCESS
+        # -----------------------------------------------------
+
+        if tests_passed:
+
+            print()
+            print("=" * 70)
+            print("IMPLEMENTATION VERIFICATION: PASSED")
+            print("=" * 70)
+
+            changed_text = (
+                ", ".join(actual_changes)
+                if actual_changes
+                else "none"
+            )
+
+            # Persist successful task completion.
+            set_task_status(
+                task.task_id,
+                "completed",
+            )
+
+            print()
+            print("WORKFLOW STATE UPDATED")
+            print("-" * 70)
+            print(
+                f"{task.task_id} -> completed"
+            )
+
+            return (
+                "STATUS: IMPLEMENTATION_COMPLETED\n\n"
+                f"Attempt: {attempt}\n"
+                f"Files changed: {changed_text}\n\n"
+                "Verification:\n"
+                f"{test_output}\n\n"
+                f"Workflow state: {task.task_id} -> completed"
+            )
+
+        # -----------------------------------------------------
+        # FAILURE → repair feedback.
+        # -----------------------------------------------------
+
+        previous_test_feedback = test_output
+
+        print()
+        print("=" * 70)
+        print("IMPLEMENTATION VERIFICATION: FAILED")
+        print("=" * 70)
+
+        if attempt < MAX_IMPLEMENTATION_ATTEMPTS:
+
+            print()
+            print(
+                "Sending verification failure back to "
+                "Nemotron for a scoped repair..."
+            )
+
+        else:
+
+            print()
+            print(
+                "Maximum implementation attempts reached."
+            )
+
+    # =========================================================
+    # BLOCKED
+    # =========================================================
+
+    return (
+        "STATUS: IMPLEMENTATION_BLOCKED\n\n"
+        "The implementation agent could not produce a "
+        "verified implementation within the allowed attempts.\n\n"
+        "Last verification result:\n"
+        f"{previous_test_feedback}"
+    )
